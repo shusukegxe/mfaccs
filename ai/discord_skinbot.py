@@ -2122,14 +2122,14 @@ async def pet_cmd(interaction: discord.Interaction, action: str,
 
 
 # ---------------------------------------------------------------- moderation
-# moderación remota del client: edita moderation.json en el REPO DEL CLIENT
-# (DevOfficial-Client/MiniFeather-Client, configurable con MFSB_MOD_*), el
-# mismo json que los clientes fetchean en boot + cada 5 min. ban/unban y
-# brick/unbrick casan por uuid y/o nombre exacto (case-insensitive, igual
-# que MF_Moderation.js); brick = pantalla azul tipo windows y, con wipe,
-# reseteo del storage local del client; killon/killoff = kill switch total
-# (con screen:bsod opcional); block/unblock = módulos por path. commit al
-# repo del client y los clientes obedecen solos en <=5 min.
+# remote moderation of the client: edits moderation.json in the CLIENT'S REPO
+# (DevOfficial-Client/MiniFeather-Client, configurable via MFSB_MOD_*), the
+# same json clients fetch at boot + every 5 min. ban/unban and brick/unbrick
+# match by uuid and/or exact name (case-insensitive, same rules as
+# MF_Moderation.js); brick = windows-style blue screen and, with wipe, a
+# reset of the client's local storage; killon/killoff = total kill switch
+# (screen:bsod optional); block/unblock = modules by path. commit to the
+# client repo and clients obey on their own within <=5 min.
 
 MOD_REPO = os.environ.get("MFSB_MOD_REPO") or "DevOfficial-Client/MiniFeather-Client"
 MOD_BRANCH = os.environ.get("MFSB_MOD_BRANCH") or "main"
@@ -2139,8 +2139,9 @@ MOD_RAW_MIRROR = f"https://raw.githubusercontent.com/{MOD_REPO}/{MOD_BRANCH}/mir
 
 
 def mod_valid_path(p):
-    """Solo paths de módulos reales: src/a/b.js. Los '..' y '.' como segmento
-    no pasan — el charclass solo no basta porque aceptaría src/../../evil.js."""
+    """Only real module paths: src/a/b.js. '.' and '..' as a segment don't
+    pass — the charclass alone doesn't cut it, it would happily accept
+    src/../../evil.js."""
     if not re.match(r"^src/[\w.\-]+(?:/[\w.\-]+)*\.js$", p or ""):
         return False
     segs = p.split("/")
@@ -2159,10 +2160,10 @@ def mod_default():
 
 
 def mod_download():
-    """Trae moderation.json del repo del client. Devuelve (data, sha).
-    404 → config de fábrica (el PUT la crea). Corrupta/v rara → (None, sha):
-    no se toca ni por error, un json roto no brickea a nadie pero tampoco
-    hay que empeorarlo."""
+    """Fetch moderation.json from the client repo. Returns (data, sha).
+    404 → factory config (the PUT creates it). Corrupt/odd v → (None, sha):
+    left untouched on purpose — a broken json bricks nobody, but there's no
+    need to make it worse either."""
     r = requests.get(f"{MOD_API}?ref={MOD_BRANCH}", headers=gh_headers(), timeout=15)
     if r.status_code == 404:
         return mod_default(), None
@@ -2187,7 +2188,7 @@ def mod_download():
 
 
 def mod_upload(data, sha, msg):
-    """Sube moderation.json al repo del client. Devuelve la URL del commit."""
+    """Upload moderation.json to the client repo. Returns the commit URL."""
     content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     payload = {
         "message": msg,
@@ -2203,7 +2204,7 @@ def mod_upload(data, sha, msg):
 
 
 def mod_target(key):
-    """(uuid, name) según casen con el regex de uuid; todo lowercase."""
+    """(uuid, name) depending on what matches the uuid regex; all lowercase."""
     key = (key or "").strip().lower()
     if UUID_RE.match(key):
         return key, ""
@@ -2211,7 +2212,7 @@ def mod_target(key):
 
 
 def mod_find(lst, key):
-    """Índice del registro que casa con key (uuid y/o name). -1 si no está."""
+    """Index of the record matching key (uuid and/or name). -1 if absent."""
     uuid, name = mod_target(key)
     for idx, rec in enumerate(lst or []):
         if not isinstance(rec, dict):
@@ -2224,8 +2225,8 @@ def mod_find(lst, key):
 
 
 def mod_mirror_paths():
-    """mainStart del mirror.json remoto para validar paths de block.
-    None = no se pudo validar (no bloqueo el comando por eso)."""
+    """mainStart from the remote mirror.json, to validate block paths.
+    None = couldn't validate (not a good reason to block the command)."""
     try:
         r = requests.get(MOD_RAW_MIRROR, timeout=10)
         if r.status_code == 200:
