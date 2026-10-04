@@ -36,4 +36,6 @@ jobs:
           MFSB_CHANNEL: ${{ secrets.MFSB_CHANNEL }}
           MFSB_REPO: ${{ github.repository }} 
           MFSB_ACC_REPO: ${{ secrets.MFSB_ACC_REPO }}
+          MFSB_MOD_REPO: ${{ secrets.MFSB_MOD_REPO }}
+          MFSB_MOD_PATH: ${{ secrets.MFSB_MOD_PATH }}
         run: python ai/discord_skinbot.py

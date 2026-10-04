@@ -2121,6 +2121,311 @@ async def pet_cmd(interaction: discord.Interaction, action: str,
             pass
 
 
+# ---------------------------------------------------------------- moderation
+# moderación remota del client: edita moderation.json en el REPO DEL CLIENT
+# (DevOfficial-Client/MiniFeather-Client, configurable con MFSB_MOD_*), el
+# mismo json que los clientes fetchean en boot + cada 5 min. ban/unban y
+# brick/unbrick casan por uuid y/o nombre exacto (case-insensitive, igual
+# que MF_Moderation.js); brick = pantalla azul tipo windows y, con wipe,
+# reseteo del storage local del client; killon/killoff = kill switch total
+# (con screen:bsod opcional); block/unblock = módulos por path. commit al
+# repo del client y los clientes obedecen solos en <=5 min.
+
+MOD_REPO = os.environ.get("MFSB_MOD_REPO") or "DevOfficial-Client/MiniFeather-Client"
+MOD_BRANCH = os.environ.get("MFSB_MOD_BRANCH") or "main"
+MOD_PATH = os.environ.get("MFSB_MOD_PATH") or "moderation.json"
+MOD_API = f"https://api.github.com/repos/{MOD_REPO}/contents/{MOD_PATH}"
+MOD_RAW_MIRROR = f"https://raw.githubusercontent.com/{MOD_REPO}/{MOD_BRANCH}/mirror.json"
+
+
+def mod_valid_path(p):
+    """Solo paths de módulos reales: src/a/b.js. Los '..' y '.' como segmento
+    no pasan — el charclass solo no basta porque aceptaría src/../../evil.js."""
+    if not re.match(r"^src/[\w.\-]+(?:/[\w.\-]+)*\.js$", p or ""):
+        return False
+    segs = p.split("/")
+    return all(s not in (".", "..") for s in segs)
+
+
+def mod_default():
+    return {
+        "v": 1,
+        "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "killSwitch": {"active": False, "reason": "", "since": "", "screen": "overlay"},
+        "bannedAccounts": [],
+        "brickedAccounts": [],
+        "blockedModules": {},
+    }
+
+
+def mod_download():
+    """Trae moderation.json del repo del client. Devuelve (data, sha).
+    404 → config de fábrica (el PUT la crea). Corrupta/v rara → (None, sha):
+    no se toca ni por error, un json roto no brickea a nadie pero tampoco
+    hay que empeorarlo."""
+    r = requests.get(f"{MOD_API}?ref={MOD_BRANCH}", headers=gh_headers(), timeout=15)
+    if r.status_code == 404:
+        return mod_default(), None
+    r.raise_for_status()
+    j = r.json()
+    content = base64.b64decode(j["content"]).decode("utf-8")
+    sha = j["sha"]
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        warn("moderation.json remoto corrupto:", e)
+        return None, sha
+    if not isinstance(data, dict) or data.get("v") != 1:
+        warn("moderation.json remoto con v inesperada: no se toca")
+        return None, sha
+    data.setdefault("killSwitch", {"active": False, "reason": "", "since": "", "screen": "overlay"})
+    data.setdefault("bannedAccounts", [])
+    data.setdefault("brickedAccounts", [])
+    if not isinstance(data.get("blockedModules"), dict) or isinstance(data.get("blockedModules"), list):
+        data["blockedModules"] = {}
+    return data, sha
+
+
+def mod_upload(data, sha, msg):
+    """Sube moderation.json al repo del client. Devuelve la URL del commit."""
+    content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    payload = {
+        "message": msg,
+        "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+        "branch": MOD_BRANCH,
+    }
+    if sha:
+        payload["sha"] = sha
+    r = requests.put(MOD_API, headers=gh_headers(), json=payload, timeout=20)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub {r.status_code}: {r.text[:300]}")
+    return r.json().get("commit", {}).get("html_url", "")
+
+
+def mod_target(key):
+    """(uuid, name) según casen con el regex de uuid; todo lowercase."""
+    key = (key or "").strip().lower()
+    if UUID_RE.match(key):
+        return key, ""
+    return "", key
+
+
+def mod_find(lst, key):
+    """Índice del registro que casa con key (uuid y/o name). -1 si no está."""
+    uuid, name = mod_target(key)
+    for idx, rec in enumerate(lst or []):
+        if not isinstance(rec, dict):
+            continue
+        if uuid and rec.get("uuid") == uuid:
+            return idx
+        if name and rec.get("name") == name:
+            return idx
+    return -1
+
+
+def mod_mirror_paths():
+    """mainStart del mirror.json remoto para validar paths de block.
+    None = no se pudo validar (no bloqueo el comando por eso)."""
+    try:
+        r = requests.get(MOD_RAW_MIRROR, timeout=10)
+        if r.status_code == 200:
+            return set(r.json().get("mainStart") or [])
+    except Exception as e:
+        warn("mirror check falló:", repr(e))
+    return None
+
+
+def mod_since():
+    return time.strftime("%Y-%m-%d")
+
+
+def mod_fmt_record(rec, kind=""):
+    who = " / ".join([rec.get("uuid", ""), rec.get("name", "")]).strip(" /") or "?"
+    extra = []
+    if kind == "brick" and rec.get("wipe"):
+        extra.append("wipe")
+    if rec.get("reason"):
+        extra.append(rec["reason"])
+    return f"`{who}`" + (f" ({'; '.join(extra)})" if extra else "")
+
+
+async def notify_moderation(text):
+    """Audit trail: cada mutación de moderación al canal de logs."""
+    try:
+        ch = await log_channel()
+        if ch is not None:
+            await ch.send(text)
+    except Exception as e:
+        warn("notify_moderation falló:", repr(e))
+
+
+@tree.command(name="moderation", description="(admin) Moderación remota del client: ban / brick / kill switch / bloqueo de módulos")
+@app_commands.describe(
+    action="show / ban / unban / brick / unbrick / killon / killoff / block / unblock",
+    player="uuid o nombre exacto de Miniblox (ban, unban, brick, unbrick)",
+    reason="motivo — lo ve el usuario en pantalla",
+    wipe="solo brick: resetear también el storage local del client de esa cuenta",
+    screen="solo killon: overlay clásico o pantalla azul (bsod)",
+    path="src/....js (block / unblock)",
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="show", value="show"),
+    app_commands.Choice(name="ban", value="ban"),
+    app_commands.Choice(name="unban", value="unban"),
+    app_commands.Choice(name="brick", value="brick"),
+    app_commands.Choice(name="unbrick", value="unbrick"),
+    app_commands.Choice(name="killon", value="killon"),
+    app_commands.Choice(name="killoff", value="killoff"),
+    app_commands.Choice(name="block", value="block"),
+    app_commands.Choice(name="unblock", value="unblock"),
+])
+@app_commands.choices(screen=[
+    app_commands.Choice(name="overlay", value="overlay"),
+    app_commands.Choice(name="bsod (pantalla azul)", value="bsod"),
+])
+async def moderation_cmd(interaction: discord.Interaction,
+                         action: str, player: str = "", reason: str = "",
+                         wipe: bool = False, screen: str = "overlay",
+                         path: str = ""):
+    if not in_channel(interaction):
+        await interaction.response.send_message("Canal no autorizado.", ephemeral=True)
+        return
+    if not is_admin(interaction):
+        await interaction.response.send_message("No autorizado.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    act = (action or "").lower()
+
+    try:
+        data, sha = mod_download()
+        if data is None:
+            await fup(interaction, "moderation.json remoto corrupto o con v rara: no lo toco (arreglar a mano).")
+            return
+
+        if act == "show":
+            ks = data.get("killSwitch", {})
+            if ks.get("active"):
+                ksline = "ACTIVO — " + (ks.get("reason") or "sin motivo") + (" [pantalla azul]" if ks.get("screen") == "bsod" else "")
+            else:
+                ksline = "inactivo"
+            bans = data.get("bannedAccounts", [])
+            bricks = data.get("brickedAccounts", [])
+            blocks = data.get("blockedModules", {})
+            lines = [f"**moderation.json** — `{MOD_REPO}@{MOD_BRANCH}`",
+                     f"kill switch: **{ksline}**",
+                     f"baneados ({len(bans)}): " + (", ".join(mod_fmt_record(b) for b in bans[:20]) or "—"),
+                     f"ladrillados ({len(bricks)}): " + (", ".join(mod_fmt_record(b, "brick") for b in bricks[:20]) or "—")]
+            bl = [f"`{p}`" + (f" ({r})" if r else "") for p, r in blocks.items()]
+            lines.append(f"módulos bloqueados ({len(bl)}): " + (", ".join(bl[:20]) or "—"))
+            lines.append(f"actualizada: {data.get('updated', '?')}")
+            await fup(interaction, "\n".join(lines))
+            return
+
+        if act in ("ban", "unban", "brick", "unbrick"):
+            uuid, name = mod_target(player)
+            if not uuid and not name:
+                await fup(interaction, "Falta <player> (uuid o nombre exacto de Miniblox).")
+                return
+            who = uuid or name
+            kdisp = "uuid" if uuid else "nombre"
+
+            if act in ("ban", "brick"):
+                field = "bannedAccounts" if act == "ban" else "brickedAccounts"
+                lst = data.setdefault(field, [])
+                if mod_find(lst, who) >= 0:
+                    await fup(interaction, f"`{who}` ya está en `{field}`.")
+                    return
+                rec = {"uuid": uuid, "name": name,
+                       "reason": (reason or "").strip()[:300], "since": mod_since()}
+                if act == "brick":
+                    rec["wipe"] = bool(wipe)
+                lst.append(rec)
+                commit = mod_upload(data, sha, f"modbot: {act} {who}")
+                if act == "brick":
+                    detail = "pantalla azul + wipe local" if wipe else "pantalla azul"
+                    verb = "LADRILLADO"
+                else:
+                    detail = ""
+                    verb = "Baneado"
+                motivo = rec["reason"] or "sin motivo especificado"
+                resp = (f"{verb} **{who}** ({kdisp}) — {detail}. Efecto en ≤5 min.\n"
+                        f"Motivo: {motivo}\n{commit}")
+            else:
+                field = "bannedAccounts" if act == "unban" else "brickedAccounts"
+                lst = data.setdefault(field, [])
+                idx = mod_find(lst, who)
+                if idx < 0:
+                    await fup(interaction, f"`{who}` no está en `{field}`.")
+                    return
+                lst.pop(idx)
+                commit = mod_upload(data, sha, f"modbot: {act} {who}")
+                verb = "Desladrillado" if act == "unbrick" else "Desbaneado"
+                resp = f"{verb} **{who}** ({kdisp}) — el client se restaura solo en ≤5 min.\n{commit}"
+
+            await fup(interaction, resp)
+            await notify_moderation(
+                f"🛡️ {interaction.user.mention} `/moderation {act}` → **{who}**"
+                + (f" — {motivo}" if act in ("ban", "brick") else ""))
+            return
+
+        if act in ("killon", "killoff"):
+            if act == "killon":
+                data["killSwitch"] = {
+                    "active": True,
+                    "reason": (reason or "").strip()[:300],
+                    "since": mod_since(),
+                    "screen": "bsod" if screen == "bsod" else "overlay",
+                }
+                modo = "pantalla azul" if screen == "bsod" else "overlay clásico"
+                resp = (f"KILL SWITCH ACTIVADO ({modo}). Todos los clients se apagan en ≤5 min.\n"
+                        f"Motivo: {data['killSwitch']['reason'] or 'sin motivo especificado'}\n")
+            else:
+                data["killSwitch"] = {"active": False, "reason": "", "since": "", "screen": "overlay"}
+                resp = "Kill switch desactivado — los clients se restauran solos en ≤5 min.\n"
+            commit = mod_upload(data, sha, f"modbot: {act}")
+            await fup(interaction, resp + commit)
+            await notify_moderation(f"🛡️ {interaction.user.mention} `/moderation {act}`"
+                                    + (f" — {data['killSwitch'].get('reason')}" if act == "killon" else ""))
+            return
+
+        if act in ("block", "unblock"):
+            p = (path or "").strip().replace("\\", "/")
+            if not mod_valid_path(p):
+                await fup(interaction, f"Path raro: `{p or '(vacío)'}`. Espero `src/....js` (sin `..`).")
+                return
+            if act == "block":
+                mirror = mod_mirror_paths()
+                warning = ""
+                if mirror is not None and p not in mirror:
+                    warning = "\n⚠️ ese path no está en mirror.json mainStart (¿existe?)"
+                if p in data.get("blockedModules", {}):
+                    await fup(interaction, f"`{p}` ya está bloqueado.")
+                    return
+                data.setdefault("blockedModules", {})[p] = (reason or "").strip()[:300]
+                commit = mod_upload(data, sha, f"modbot: block {p}")
+                await fup(interaction,
+                          f"Módulo bloqueado: `{p}` — aplica en el próximo arranque (el client se recarga solo).{warning}\n{commit}")
+            else:
+                if p not in data.get("blockedModules", {}):
+                    await fup(interaction, f"`{p}` no está bloqueado.")
+                    return
+                del data["blockedModules"][p]
+                commit = mod_upload(data, sha, f"modbot: unblock {p}")
+                await fup(interaction, f"Módulo desbloqueado: `{p}`.\n{commit}")
+            await notify_moderation(f"🛡️ {interaction.user.mention} `/moderation {act}` → `{p}`")
+            return
+
+        await fup(interaction, "Acción desconocida. show / ban / unban / brick / unbrick / killon / killoff / block / unblock")
+
+    except Exception as e:
+        warn("moderation falló:", repr(e))
+        try:
+            await fup(interaction, f"Error: {e}")
+        except Exception:
+            pass
+
+
 @tree.command(name="panel", description="Panel de cuentas y skins de MiniFeather")
 async def panel_cmd(interaction: discord.Interaction):
     if not in_channel(interaction):
